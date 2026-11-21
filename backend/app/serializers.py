@@ -1,8 +1,9 @@
 """ORM → 字典序列化（接口出参统一在此组装）。"""
 from .models import (
-    AccessEvent, DataProduct, EthicsApproval, ProductField, Project,
-    ProjectMember, ProjectPurpose, QualificationBatch, QualificationInstance,
-    QuotaAccount, QuotaReservation, UsageEvent, UsageReport, User,
+    AccessEvent, CollectionPause, DataProduct, EthicsApproval, ProductField,
+    Project, ProjectMember, ProjectPurpose, QualificationBatch,
+    QualificationInstance, QuotaAccount, QuotaReservation, ReadinessSnapshot,
+    RefreshContract, RefreshEvent, ResearchCenter, UsageEvent, UsageReport, User,
 )
 
 
@@ -166,3 +167,68 @@ def access_event_dict(e: AccessEvent, detail: bool = False) -> dict:
         d["qualification_snapshot"] = e.qualification_snapshot
         d["quota_snapshot"] = e.quota_snapshot
     return d
+
+
+# ---------------- 刷新时效 ----------------
+
+def center_dict(c: ResearchCenter) -> dict:
+    return {
+        "id": c.id, "code": c.code, "name": c.name,
+        "weekday_schedule": c.weekday_schedule or [], "note": c.note,
+    }
+
+
+def contract_dict(c: RefreshContract) -> dict:
+    return {
+        "id": c.id, "center_id": c.center_id,
+        "center_code": c.center.code if c.center else None,
+        "center_name": c.center.name if c.center else None,
+        "product_id": c.product_id,
+        "product_code": c.product.code if c.product else None,
+        "product_name": c.product.name if c.product else None,
+        "frequency": c.frequency, "expected_window_days": c.expected_window_days,
+        "cutoff_time": c.cutoff_time,
+        "statistical_quantile": c.statistical_quantile,
+        "min_history_for_stat": c.min_history_for_stat, "active": c.active,
+    }
+
+
+def pause_dict(p: CollectionPause) -> dict:
+    return {
+        "id": p.id, "center_id": p.center_id, "product_id": p.product_id,
+        "pause_from": p.pause_from.isoformat(), "pause_to": p.pause_to.isoformat(),
+        "reason": p.reason,
+    }
+
+
+def refresh_event_dict(e: RefreshEvent) -> dict:
+    return {
+        "id": e.id, "center_id": e.center_id,
+        "center_code": e.center.code if e.center else None,
+        "product_id": e.product_id,
+        "product_code": e.product.code if e.product else None,
+        "partition_date": e.partition_date.isoformat(),
+        "batch_no": e.batch_no, "event_kind": e.event_kind, "status": e.status,
+        "generated_at": e.generated_at.isoformat() if e.generated_at else None,
+        "received_at": e.received_at.isoformat() if e.received_at else None,
+        "validated_at": e.validated_at.isoformat() if e.validated_at else None,
+        "qc_failed_at": e.qc_failed_at.isoformat() if e.qc_failed_at else None,
+        "fail_reason": e.fail_reason, "record_count": e.record_count,
+        "revision_no": e.revision_no, "correction_of_id": e.correction_of_id,
+        "expected_due_at": e.expected_due_at.isoformat() if e.expected_due_at else None,
+        "first_publish_delay_hours": e.first_publish_delay_hours,
+        "correction_delay_hours": e.correction_delay_hours,
+    }
+
+
+def readiness_dict(s: ReadinessSnapshot) -> dict:
+    return {
+        "id": s.id, "project_id": s.project_id, "center_id": s.center_id,
+        "product_id": s.product_id,
+        "analysis_cutoff": s.analysis_cutoff.isoformat(),
+        "window_from": s.window_from.isoformat(), "mode": s.mode,
+        "state": s.state, "reason": s.reason,
+        "watermark": s.watermark_snapshot, "evidence": s.evidence,
+        "superseded": s.superseded, "created_by": s.created_by,
+        "created_at": s.created_at.isoformat(),
+    }

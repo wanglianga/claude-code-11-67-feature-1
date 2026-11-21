@@ -298,3 +298,143 @@ class AccessEvent(Base):
     qualification_snapshot: Mapped[dict] = mapped_column(JSONB, default=dict)  # 当时的资格依据
     quota_snapshot: Mapped[dict] = mapped_column(JSONB, default=dict)          # 当时的额度变化
     created_at: Mapped[datetime] = mapped_column(sa.DateTime, default=datetime.utcnow)
+
+
+# ==================== 数据产品刷新时效：中心 / 合约 / 停诊 / 刷新事件 / 就绪快照 ====================
+
+# 刷新事件状态：已接收（质控未完成）/ 已校验（可用）/ 校验失败（不可用）/ 已更正（旧批次被后续批次更正）
+REFRESH_EVENT_STATUSES = ("已接收", "已校验", "校验失败", "已更正")
+# 事件性质：全量刷新 / 迟到补传 / 更正发布（更正不是全量刷新）
+REFRESH_KINDS = ("全量刷新", "迟到补传", "更正发布")
+# 就绪判定状态：及时 / 延迟 / 缺失 / 待校验 / 预期无采集
+READINESS_STATES = ("及时", "延迟", "缺失", "待校验", "预期无采集")
+# 判定模式：固定期限（按目录约定）/ 统计阈值（按历史到达分布）
+READINESS_MODES = ("fixed", "statistical")
+
+
+class ResearchCenter(Base):
+    """研究中心：数据产品按中心分区交付，刷新时效画像按（中心 × 产品）建立。"""
+
+    __tablename__ = "research_centers"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    code: Mapped[str] = mapped_column(sa.String(32), unique=True, index=True)
+    name: Mapped[str] = mapped_column(sa.String(128))
+    # 周内排程（ISO 周一=1 … 周日=7）：按日中心通常为 1-5，按周中心为指定工作日
+    weekday_schedule: Mapped[list] = mapped_column(JSONB, default=list)
+    note: Mapped[str] = mapped_column(sa.String(256), default="")
+    created_at: Mapped[datetime] = mapped_column(sa.DateTime, default=datetime.utcnow)
+
+
+class RefreshContract(Base):
+    """刷新合约（目录约定）：（中心 × 产品）分区的预期交付窗与固定期限阈值。
+
+    expected_window_days：分区数据日之后多少个自然日内应交付（固定期限判定的逾期阈值）。
+    cutoff_time：交付窗截止时刻（HH:MM），与 expected_window_days 共同确定 expected_due_at。
+    statistical_quantile：统计阈值模式使用的历史分位（如 0.9）。
+    min_history_for_stat：统计模式要求的最少历史已校验批次，不足时回退固定期限并说明原因。
+    """
+
+    __tablename__ = "refresh_contracts"
+    __table_args__ = (sa.UniqueConstraint("center_id", "product_id"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    center_id: Mapped[int] = mapped_column(sa.ForeignKey("research_centers.id"), index=True)
+    product_id: Mapped[int] = mapped_column(sa.ForeignKey("data_products.id"), index=True)
+    frequency: Mapped[str] = mapped_column(sa.String(16))  # 每日/每周/每月
+    expected_window_days: Mapped[int] = mapped_column(sa.Integer, default=1)
+    cutoff_time: Mapped[str] = mapped_column(sa.String(8), default="18:00")
+    statistical_quantile: Mapped[float] = mapped_column(sa.Float, default=0.9)
+    min_history_for_stat: Mapped[int] = mapped_column(sa.Integer, default=8)
+    active: Mapped[bool] = mapped_column(sa.Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(sa.DateTime, default=datetime.utcnow)
+
+    center: Mapped[ResearchCenter] = relationship()
+    product: Mapped[DataProduct] = relationship()
+
+
+class CollectionPause(Base):
+    """计划停诊/停采窗口：窗口内分区不预期采集，缺批次标记「预期无采集」而非迟交。"""
+
+    __tablename__ = "collection_pauses"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    center_id: Mapped[int] = mapped_column(sa.ForeignKey("research_centers.id"), index=True)
+    product_id: Mapped[int | None] = mapped_column(
+        sa.ForeignKey("data_products.id"), nullable=True, index=True)  # null = 中心整体停诊
+    pause_from: Mapped[date] = mapped_column(sa.Date, index=True)
+    pause_to: Mapped[date] = mapped_column(sa.Date)
+    reason: Mapped[str] = mapped_column(sa.String(256), default="")  # 计划停诊/设备维护/节假日安排
+    created_at: Mapped[datetime] = mapped_column(sa.DateTime, default=datetime.utcnow)
+
+
+class RefreshEvent(Base):
+    """刷新事件：中心-产品分区一次批次的生成/接收/校验全过程记录。
+
+    关键区分：
+    - event_kind=更正发布 表示对旧分区的修订，不是全量刷新；correction_of_id 指向被更正的旧事件；
+    - 校验未通过（status=校验失败）只代表文件到达，不计入可用水位；
+    - 迟到补传（event_kind=迟到补传）是历史分区的补交付，首次发布延迟与更正延迟分别统计。
+    可用批次（is_available）= 已校验 或 已更正（被更正事件保留首次发布事实，水位由替代批次承担）。
+    """
+
+    __tablename__ = "refresh_events"
+    __table_args__ = (
+        sa.UniqueConstraint("center_id", "product_id", "partition_date", "event_kind",
+                            "correction_of_id", name="uq_refresh_partition_attempt"),
+        sa.Index("ix_refresh_lookup", "center_id", "product_id", "partition_date"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    center_id: Mapped[int] = mapped_column(sa.ForeignKey("research_centers.id"), index=True)
+    product_id: Mapped[int] = mapped_column(sa.ForeignKey("data_products.id"), index=True)
+    partition_date: Mapped[date] = mapped_column(sa.Date, index=True)  # 批次对应的数据日（周/月产品为周期起始日）
+    batch_no: Mapped[str] = mapped_column(sa.String(40), unique=True, index=True)
+    event_kind: Mapped[str] = mapped_column(sa.String(16), default="全量刷新")  # 全量刷新/迟到补传/更正发布
+    status: Mapped[str] = mapped_column(sa.String(16), default="已接收")
+    generated_at: Mapped[datetime | None] = mapped_column(sa.DateTime, nullable=True)  # 批次生成时间
+    received_at: Mapped[datetime] = mapped_column(sa.DateTime)   # 批次接收时间（文件到达）
+    validated_at: Mapped[datetime | None] = mapped_column(sa.DateTime, nullable=True)  # 质控通过时间
+    qc_failed_at: Mapped[datetime | None] = mapped_column(sa.DateTime, nullable=True)
+    fail_reason: Mapped[str | None] = mapped_column(sa.String(256), nullable=True)
+    record_count: Mapped[int] = mapped_column(sa.Integer, default=0)  # 批次记录数（水位佐证，系统不补造数据）
+    revision_no: Mapped[int] = mapped_column(sa.Integer, default=1)  # 1=首次发布，>1=修订版次
+    correction_of_id: Mapped[int | None] = mapped_column(
+        sa.ForeignKey("refresh_events.id"), nullable=True)
+    # 预期交付截止（由合约与排程在登记时计算落库，作为固定期限判定与复算依据）
+    expected_due_at: Mapped[datetime] = mapped_column(sa.DateTime)
+    # 画像度量落库（登记/QC/更正时计算），便于直接复算与审计
+    first_publish_delay_hours: Mapped[float | None] = mapped_column(sa.Float, nullable=True)
+    correction_delay_hours: Mapped[float | None] = mapped_column(sa.Float, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(sa.DateTime, default=datetime.utcnow)
+
+    center: Mapped[ResearchCenter] = relationship()
+    product: Mapped[DataProduct] = relationship()
+    correction_of: Mapped["RefreshEvent | None"] = relationship(remote_side="RefreshEvent.id")
+
+
+class ReadinessSnapshot(Base):
+    """就绪判定快照：评估时把所引用的水位与全部依据冻结，后续新批次不改变历史判断。
+
+    新增批次只重算涉及的（中心/产品分区、研究截止范围）；旧快照保留其 watermark_snapshot，
+    审计时可凭引用的事件 id 列表由刷新事件重新复算。
+    """
+
+    __tablename__ = "readiness_snapshots"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[int] = mapped_column(sa.ForeignKey("projects.id"), index=True)
+    center_id: Mapped[int] = mapped_column(sa.ForeignKey("research_centers.id"), index=True)
+    product_id: Mapped[int] = mapped_column(sa.ForeignKey("data_products.id"), index=True)
+    analysis_cutoff: Mapped[date] = mapped_column(sa.Date, index=True)  # 分析截止日
+    window_from: Mapped[date] = mapped_column(sa.Date)                  # 研究时间窗起
+    mode: Mapped[str] = mapped_column(sa.String(16))                    # fixed/statistical
+    state: Mapped[str] = mapped_column(sa.String(16))                   # 及时/延迟/缺失/待校验/预期无采集
+    reason: Mapped[str] = mapped_column(sa.String(512), default="")
+    # 冻结的实际水位与证据（实际水位而非只有红黄状态）
+    watermark_snapshot: Mapped[dict] = mapped_column(JSONB, default=dict)
+    # 复算依据：参与判定的刷新事件 id、阈值版本、画像分位数等
+    evidence: Mapped[dict] = mapped_column(JSONB, default=dict)
+    superseded: Mapped[bool] = mapped_column(sa.Boolean, default=False)  # 涉及分区出现新批次后标记（旧记录仍保留）
+    created_by: Mapped[str] = mapped_column(sa.String(64), default="system")
+    created_at: Mapped[datetime] = mapped_column(sa.DateTime, default=datetime.utcnow)

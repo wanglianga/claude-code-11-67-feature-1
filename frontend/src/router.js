@@ -8,6 +8,7 @@ const routes = [
   { path: '/workbench', component: () => import('./views/WorkbenchView.vue'), meta: { title: '资格开通' } },
   { path: '/access', component: () => import('./views/AccessView.vue'), meta: { title: '数据访问' } },
   { path: '/quota', component: () => import('./views/QuotaView.vue'), meta: { title: '额度账本' } },
+  { path: '/refresh', component: () => import('./views/RefreshView.vue'), meta: { title: '刷新时效画像' } },
   { path: '/audit', component: () => import('./views/AuditView.vue'), meta: { title: '审计查询' } },
 ]
 

@@ -1,21 +1,23 @@
 """演示种子数据（全部为虚构输入）：产品目录、课题档案、伦理批件、成员、
 额度账户、首批资格实例与一次示范访问。幂等：已有用户时跳过。"""
-import uuid
-from datetime import date, timedelta
+import random
+from datetime import date, datetime, time, timedelta
 
 from sqlalchemy.orm import Session
 
 from .models import (
-    AccessEvent, DataProduct, EthicsApproval, ProductField, Project,
-    ProjectMember, ProjectPurpose, QualificationBatch, QualificationInstance,
-    QuotaAccount, QuotaReservation, User,
+    AccessEvent, CollectionPause, DataProduct, EthicsApproval, ProductField,
+    Project, ProjectMember, ProjectPurpose, QualificationBatch,
+    QualificationInstance, QuotaAccount, RefreshContract, ResearchCenter, User,
 )
 from .security import hash_password
 from .services import quota as quota_svc
 from .services.compiler import compile_qualification
+from .services import refresh as refresh_svc
 
 TODAY = date.today()
 D = timedelta(days=1)
+_rng = random.Random(20261121)
 
 
 def _product(db, code, name, source, freq, dept, desc, fields):
@@ -285,4 +287,177 @@ def seed(db: Session) -> None:
     db.add(event); db.flush()
     reservation.access_event_id = event.id
     usage.access_event_id = event.id
+
+    _seed_refresh(db, {"P-IMG": p_img, "P-LAB": p_lab, "P-FU": p_fu, "P-BIO": p_bio},
+                  {"PRJ-A": prj_a, "PRJ-B": prj_b, "PRJ-C": prj_c})
     db.commit()
+
+
+# ==================== 刷新时效演示数据（中心 / 合约 / 停诊 / 刷新事件 / 就绪快照） ====================
+
+def _dt(day: date, hour: int, minute: int = 0) -> datetime:
+    return datetime.combine(day, time(hour, minute))
+
+
+def _seed_refresh(db: Session, products: dict, projects: dict) -> None:
+    """构造覆盖题目全部场景的虚构刷新历史：
+    按日/按周/每月中心、周末停采、计划停诊、质控失败后补传、历史更正、
+    迟到批次、待校验批次与长期无新批次。
+    """
+    # ---- 中心：排程为 ISO 周几（1=周一…7=周日），均不含周末 → 周末停采 ----
+    c1 = ResearchCenter(code="RC-01", name="城东综合医学中心",
+                        weekday_schedule=[1, 2, 3, 4, 5], note="工作日每日交付影像/检验分区")
+    c2 = ResearchCenter(code="RC-02", name="西城专科随访中心",
+                        weekday_schedule=[1, 3, 5], note="周一/三/五排程，随访产品按周交付")
+    c3 = ResearchCenter(code="RC-03", name="南郊分院",
+                        weekday_schedule=[1, 2, 3, 4, 5], note="近期设备老化，检验分区存在长期断更")
+    db.add_all([c1, c2, c3]); db.flush()
+
+    contracts = [
+        RefreshContract(center_id=c1.id, product_id=products["P-LAB"].id, frequency="每日",
+                        expected_window_days=1, cutoff_time="18:00", min_history_for_stat=8),
+        RefreshContract(center_id=c1.id, product_id=products["P-IMG"].id, frequency="每日",
+                        expected_window_days=1, cutoff_time="20:00", min_history_for_stat=8),
+        RefreshContract(center_id=c2.id, product_id=products["P-FU"].id, frequency="每周",
+                        expected_window_days=2, cutoff_time="18:00", min_history_for_stat=8),
+        RefreshContract(center_id=c3.id, product_id=products["P-LAB"].id, frequency="每日",
+                        expected_window_days=1, cutoff_time="18:00", min_history_for_stat=8),
+        RefreshContract(center_id=c3.id, product_id=products["P-BIO"].id, frequency="每月",
+                        expected_window_days=3, cutoff_time="17:00", min_history_for_stat=4),
+    ]
+    db.add_all(contracts); db.flush()
+
+    # ---- 计划停诊/停采窗口：窗口内不预期采集，不算迟交 ----
+    pause_start, pause_end = TODAY - 15 * D, TODAY - 13 * D
+    db.add(CollectionPause(center_id=c1.id, product_id=products["P-LAB"].id,
+                           pause_from=pause_start, pause_to=pause_end,
+                           reason="检验流水线设备维护（计划停采）"))
+    db.add(CollectionPause(center_id=c3.id, product_id=None,
+                           pause_from=TODAY - 6 * D, pause_to=TODAY - 5 * D,
+                           reason="中心年度院感演练（整体停诊）"))
+    db.flush()
+
+    lab_pid, img_pid, fu_pid, bio_pid = (products["P-LAB"].id, products["P-IMG"].id,
+                                         products["P-FU"].id, products["P-BIO"].id)
+    qc_fail_day = TODAY - 12 * D       # 质控失败 → 迟到补传
+    correction_day = TODAY - 9 * D     # 历史更正
+    late_day = TODAY - 6 * D           # 迟交的全量刷新
+    pending_day = TODAY - 1 * D        # 已接收待校验
+    pause_dates = {pause_start + i * D for i in range(3)}
+
+    # ---- RC-01 × P-LAB：按日中心，覆盖全部典型场景 ----
+    day = TODAY - 27 * D
+    while day <= pending_day:
+        if day.isoweekday() <= 5 and day not in pause_dates:
+            if day == qc_fail_day:
+                # 批次按时到达但质控失败：文件到达 ≠ 可用数据
+                ev = refresh_svc.register_event(
+                    db, c1.id, lab_pid, day, _dt(day + 1 * D, 9, 20),
+                    generated_at=_dt(day, 21, 0), record_count=410,
+                    batch_no=f"RF-LAB-{day:%Y%m%d}-V1")
+                refresh_svc.fail_qc(db, ev.id, _dt(day + 1 * D, 11, 5),
+                                    "检验值值域校验失败：17 条结果超出参考区间")
+                # 同日的迟到补传（超过交付窗），质控通过后承担该分区水位
+                bf = refresh_svc.register_event(
+                    db, c1.id, lab_pid, day, _dt(day + 4 * D, 10, 0),
+                    event_kind="迟到补传", generated_at=_dt(day + 4 * D, 8, 30),
+                    record_count=398, batch_no=f"RF-LAB-{day:%Y%m%d}-BF")
+                refresh_svc.pass_qc(db, bf.id, _dt(day + 4 * D, 11, 30), record_count=398)
+            elif day == correction_day:
+                # 首次发布正常；后续批次发布更正（不是全量刷新），更正延迟单独统计
+                ev = refresh_svc.register_event(
+                    db, c1.id, lab_pid, day, _dt(day + 1 * D, 8, 40),
+                    record_count=522, batch_no=f"RF-LAB-{day:%Y%m%d}-V1")
+                refresh_svc.pass_qc(db, ev.id, _dt(day + 1 * D, 10, 0), record_count=522)
+                corr = refresh_svc.register_event(
+                    db, c1.id, lab_pid, day, _dt(day + 6 * D, 15, 0),
+                    event_kind="更正发布", generated_at=_dt(day + 6 * D, 14, 0),
+                    record_count=526, correction_of_id=ev.id,
+                    batch_no=f"RF-LAB-{day:%Y%m%d}-V2")
+                refresh_svc.pass_qc(db, corr.id, _dt(day + 6 * D, 16, 20), record_count=526)
+            elif day == late_day:
+                # 迟交 3 天的全量刷新
+                ev = refresh_svc.register_event(
+                    db, c1.id, lab_pid, day, _dt(day + 3 * D, 9, 10),
+                    generated_at=_dt(day + 3 * D, 7, 50),
+                    record_count=_rng.randint(300, 700),
+                    batch_no=f"RF-LAB-{day:%Y%m%d}-V1")
+                refresh_svc.pass_qc(db, ev.id, _dt(day + 3 * D, 10, 30))
+            elif day == pending_day:
+                # 已接收、质控未完成 → 就绪判定应为「待校验」
+                refresh_svc.register_event(
+                    db, c1.id, lab_pid, day, _dt(TODAY, 8, 30),
+                    generated_at=_dt(day, 22, 0), record_count=0,
+                    batch_no=f"RF-LAB-{day:%Y%m%d}-V1")
+            else:
+                ev = refresh_svc.register_event(
+                    db, c1.id, lab_pid, day,
+                    _dt(day + 1 * D, _rng.randint(8, 15), _rng.randint(0, 50)),
+                    generated_at=_dt(day, 21, 30),
+                    record_count=_rng.randint(300, 900),
+                    batch_no=f"RF-LAB-{day:%Y%m%d}-V1")
+                refresh_svc.pass_qc(db, ev.id, _dt(day + 1 * D, 17, 0))
+        day += 1 * D
+
+    # ---- RC-01 × P-IMG：按日影像分区，整体及时，最近一批待校验 ----
+    day = TODAY - 12 * D
+    while day <= TODAY - 1 * D:
+        if day.isoweekday() <= 5:
+            if day == TODAY - 1 * D:
+                refresh_svc.register_event(
+                    db, c1.id, img_pid, day, _dt(TODAY, 7, 50),
+                    generated_at=_dt(day, 23, 10), batch_no=f"RF-IMG-{day:%Y%m%d}-V1")
+            else:
+                ev = refresh_svc.register_event(
+                    db, c1.id, img_pid, day, _dt(day + 1 * D, 9, 0),
+                    record_count=_rng.randint(120, 360),
+                    batch_no=f"RF-IMG-{day:%Y%m%d}-V1")
+                refresh_svc.pass_qc(db, ev.id, _dt(day + 1 * D, 18, 0))
+        day += 1 * D
+
+    # ---- RC-02 × P-FU：按周中心，每周一一个分区，8 周历史，含 1 次迟交 ----
+    monday = TODAY - TODAY.isoweekday() * D + 1 * D  # 本周一
+    weekly_partitions = [monday - i * 7 * D for i in range(8)][::-1]
+    for idx, wday in enumerate(weekly_partitions):
+        if idx == 5:  # 一次迟交
+            ev = refresh_svc.register_event(
+                db, c2.id, fu_pid, wday, _dt(wday + 5 * D, 14, 0),
+                record_count=_rng.randint(60, 140), batch_no=f"RF-FU-{wday:%Y%m%d}-V1")
+            refresh_svc.pass_qc(db, ev.id, _dt(wday + 5 * D, 16, 0))
+        else:
+            ev = refresh_svc.register_event(
+                db, c2.id, fu_pid, wday, _dt(wday + 1 * D, 10, 0),
+                record_count=_rng.randint(60, 140), batch_no=f"RF-FU-{wday:%Y%m%d}-V1")
+            refresh_svc.pass_qc(db, ev.id, _dt(wday + 1 * D, 15, 0))
+
+    # ---- RC-03 × P-LAB：长期无新批次（TODAY-10 后断更） ----
+    day = TODAY - 24 * D
+    while day <= TODAY - 10 * D:
+        if day.isoweekday() <= 5:
+            ev = refresh_svc.register_event(
+                db, c3.id, lab_pid, day, _dt(day + 1 * D, 10, 0),
+                record_count=_rng.randint(200, 500), batch_no=f"RF-LAB3-{day:%Y%m%d}-V1")
+            refresh_svc.pass_qc(db, ev.id, _dt(day + 1 * D, 16, 0))
+        day += 1 * D
+    # ---- RC-03 × P-BIO：每月分区（每月 1 日），最近 4 个月 ----
+    for back in range(4, 0, -1):
+        m = TODAY.replace(day=1)
+        for _ in range(back):
+            m = (m.replace(day=1) - 1 * D).replace(day=1)
+        ev = refresh_svc.register_event(
+            db, c3.id, bio_pid, m, _dt(m + 2 * D, 9, 30),
+            record_count=_rng.randint(80, 200), batch_no=f"RF-BIO-{m:%Y%m}-V1")
+        refresh_svc.pass_qc(db, ev.id, _dt(m + 2 * D, 14, 0))
+
+    db.flush()
+
+    # ---- 两条示范就绪判定快照（冻结水位与证据；新批次只标记 superseded，不覆盖） ----
+    refresh_svc.evaluate_readiness(
+        db, projects["PRJ-A"].id, c1.id, lab_pid,
+        analysis_cutoff=TODAY - 3 * D, window_from=TODAY - 24 * D,
+        mode="fixed", created_by="seed")
+    refresh_svc.evaluate_readiness(
+        db, projects["PRJ-B"].id, c2.id, fu_pid,
+        analysis_cutoff=TODAY - 2 * D, window_from=weekly_partitions[0],
+        mode="statistical", created_by="seed")
+    db.flush()

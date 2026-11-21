@@ -43,6 +43,7 @@ const allMenus = [
   { path: '/workbench', title: '资格开通工作台', roles: ['ADMIN', 'PI', 'ANALYST', 'AUDITOR'] },
   { path: '/access', title: '数据访问模拟', roles: ['PI', 'ANALYST'] },
   { path: '/quota', title: '额度账本', roles: ['ADMIN', 'PI', 'ANALYST', 'AUDITOR'] },
+  { path: '/refresh', title: '刷新时效画像', roles: ['ADMIN', 'PI', 'ANALYST', 'AUDITOR'] },
   { path: '/audit', title: '审计查询', roles: ['ADMIN', 'AUDITOR'] },
 ]
 const menus = allMenus.filter((m) => !user || m.roles.includes(user.role))
